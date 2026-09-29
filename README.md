@@ -36,6 +36,13 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 闭区间与可直接使用的 `Range` 值、每个客户端被各次回源覆盖的字节，以及
 去重需求 / 实际回源 / 额外获取的字节核算（见下文）。
 
+`POST /cache-reuse-plan` 面向**资源就地编辑后的稀疏缓存复用**：上报旧资源
+大小 `size`、旧缓存闭区间 `cached` 与一组编辑 `edits`（均用**旧坐标**：
+在 `start` 处先删 `deleteBytes` 字节、再插 `insertBytes` 字节），服务算出
+新资源大小、仍可复用的"旧闭区间 → 新闭区间"映射，以及新资源需要重新获取
+的缺口闭区间。删除的字节不复用、插入的字节恒为缺口，编辑区间外的字节身份
+不变；全程只按区间端点运算，不逐字节展开（见下文）。
+
 ## 单条启动命令
 
 ```bash
@@ -685,6 +692,106 @@ curl -X POST http://localhost:3000/shared-fetch-plan \
 服务默认监听本机 **3000 端口**（`http://localhost:3000`），用
 `docker compose up --build -d` 一条命令即可启动（见上文"单条启动命令"）。
 
+### `POST /cache-reuse-plan`（编辑后稀疏缓存复用）
+
+资源经过插入 / 删除后，旧稀疏缓存里**没有落在任何删除范围**内的字节仍然
+有效，只是新偏移可能变了。本接口上报旧资源大小、旧缓存闭区间和一组编辑，
+算出新资源大小、旧→新可复用区间映射与新资源缺口。全部参数在 JSON 体内，
+不涉及 `Range` 请求头。
+
+请求体：
+
+| 字段      | 类型    | 必填 | 说明                                                         |
+| --------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`    | integer | 是   | **旧**资源总字节数，非负安全整数（≥ 0）；为 0 时 `cached` 必须为空 |
+| `cached`  | array   | 是   | 旧缓存区间数组（≤ 1000 项），每项 `{"start":…,"end":…}` 为**闭区间**（端点均含），须满足 `0 ≤ start ≤ end < size`；可乱序、重叠、相邻，先去重归并 |
+| `edits`   | array   | 是   | 编辑数组（≤ 1000 项），每项 `{"start":…,"deleteBytes":…,"insertBytes":…}`，全部使用**旧坐标**；可乱序，内部按 `start` 排序处理 |
+
+编辑语义：在旧坐标 `start` 处先删除 `deleteBytes` 个旧字节
+（`[start, start+deleteBytes-1]`），再在该位置插入 `insertBytes` 个新字节；
+编辑区间之外的字节身份与相对顺序不变。约束：
+
+- `start` 为非负安全整数、`deleteBytes` / `insertBytes` 为非负安全整数；
+- `start + deleteBytes ≤ size`，删除不得越界；`start === size` 表示**尾部
+  插入**（只能配 `deleteBytes: 0`）；
+- 不允许双零编辑（`deleteBytes` 与 `insertBytes` 同时为 0）；
+- 排序后任一编辑的 `start` 不得落入前一编辑的删除范围
+  `[prevStart, prevStart+prevDeleteBytes-1]`（恰等于删除范围终点是边界，
+  合法）；同 `start` 编辑报 400；
+- 新资源大小 `size − ΣdeleteBytes + ΣinsertBytes` 不得超过
+  `Number.MAX_SAFE_INTEGER`（`400 NEW_SIZE_OVERFLOW`）。
+
+映射规则：
+
+1. 缓存先按重叠 / 相邻**去重归并**；编辑按 `start` 排序。
+2. 每个缓存区间在每个**触及它的编辑处分裂**：删除范围中的字节丢弃（删除
+   字节永不复用），插入字节全部计入新资源缺口；编辑前的片段偏移不变，
+   编辑后的片段整体平移 `insertBytes − deleteBytes`。
+3. 相邻两段**仅当旧区间相邻且新区间也相邻**时才合并为一条映射——纯插入
+   会让旧相邻字节在新资源中间隔开插入缺口（保持分裂），纯删除则会让两侧
+   片段在新资源中相邻但旧坐标不相邻（同样保持分裂）。
+4. 新资源缺口 = 新资源中未被任何映射覆盖的闭区间，升序归并（相邻缺口
+   合并；插入字节若紧邻原有未缓存字节会并成同一段）。
+
+校验同样使用严格校验器（不做类型强转、不允许多余字段）：字符串数字、
+小数、负数、超过 `Number.MAX_SAFE_INTEGER` 的值一律 `400`；倒置 / 越界的
+缓存区间、越界删除、同起点编辑、编辑嵌套进删除范围、双零编辑、新大小溢出、
+任一数组超过 1000 项均返回 `400`。错误码包括：`INVALID_SIZE`、
+`INVALID_CACHED`、`TOO_MANY_CACHED_INTERVALS`、`INVALID_CACHED_RANGE`、
+`CACHED_RANGE_OUT_OF_BOUNDS`、`INVALID_EDITS`、`TOO_MANY_EDITS`、
+`INVALID_EDIT`、`EMPTY_EDIT`、`EDIT_OUT_OF_BOUNDS`、`DUPLICATE_EDIT_START`、
+`EDIT_INSIDE_DELETION`、`NEW_SIZE_OVERFLOW`。
+
+响应（`200`）字段：
+
+| 字段            | 说明                                                         |
+| --------------- | ------------------------------------------------------------ |
+| `oldSize`       | 旧资源大小（回显输入 `size`）                                 |
+| `newSize`       | 新资源大小，非负安全整数                                      |
+| `deletedBytes`  | 全部编辑删除的旧字节总数                                      |
+| `insertedBytes` | 全部编辑插入的新字节总数（`newSize = oldSize − deletedBytes + insertedBytes`） |
+| `mappings`      | 可复用映射数组（升序、互不重叠），每项 `oldStart`/`oldEnd`（旧闭区间）与 `newStart`/`newEnd`（新闭区间），两端长度恒等 |
+| `reusableBytes` | 可复用字节数（所有映射长度之和）                              |
+| `gaps`          | 新资源缺口闭区间数组（升序、互不重叠、已相邻归并）             |
+| `gapBytes`      | 缺口字节总数（恒等于 `newSize − reusableBytes`）              |
+
+示例：20 字节旧资源缓存了 `[0,9]` 与 `[15,19]`（各 10 字节）；在旧偏移
+10 处删除 5 字节（`[10,14]`）并插入 3 字节。新大小 18，`[0,9]` 不动，
+`[15,19]` 平移到新 `[13,17]`，插入的 3 字节是唯一缺口：
+
+```bash
+curl -X POST http://localhost:3000/cache-reuse-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"size":20,"cached":[{"start":0,"end":9},{"start":15,"end":19}],"edits":[{"start":10,"deleteBytes":5,"insertBytes":3}]}'
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "oldSize": 20,
+  "newSize": 18,
+  "deletedBytes": 5,
+  "insertedBytes": 3,
+  "mappings": [
+    { "oldStart": 0, "oldEnd": 9, "newStart": 0, "newEnd": 9 },
+    { "oldStart": 15, "oldEnd": 19, "newStart": 13, "newEnd": 17 }
+  ],
+  "reusableBytes": 15,
+  "gaps": [{ "start": 10, "end": 12 }],
+  "gapBytes": 3
+}
+```
+
+纯插入会分裂映射但不删除复用字节：10 字节资源全缓存、在旧偏移 5 处插入
+3 字节，映射分裂为旧 `[0,4]`→新 `[0,4]` 与旧 `[5,9]`→新 `[8,12]`，缺口为
+新 `[5,7]`；纯删除（如删旧 `[4,5]`）则删除范围中的缓存字节消失，两侧映射
+在**新坐标**相邻但**旧坐标**不相邻，因此不会合并。输入数组可以乱序
+（`cached` 与 `edits` 都允许），结果与顺序无关。空资源 `size: 0` 配空缓存
+与空编辑返回全空计划；空资源上 `start: 0` 的尾部插入会得到唯一缺口
+`[0, insertBytes-1]`。
+
 ## 响应语义
 
 每个规划结果带 `decision` 字段：
@@ -810,7 +917,8 @@ src/
   cache-integrity.js # 稀疏缓存完整性校验：片段合并、逐块 SHA-256 比对、verified/missing/corrupt 分类、重取区间合并
   cache-retention.js # 缓存保留规划：缓存归并、访问权重扫描线累加、按权重/偏移选满预算、截断与归并
   shared-fetch.js   # 共享回源规划：多客户端需求全局归并去重、按上限拆块、带空隙阈值的自左向右合并、逐客户端覆盖核算
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、/healthz、输入校验
+  cache-reuse.js    # 编辑后缓存复用：缓存归并、旧坐标编辑排序/合法性校验、坐标平移扫描（区间端点运算，不逐字节展开）、旧→新区间映射与新缺口归并
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、POST /cache-reuse-plan、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -822,13 +930,14 @@ test/
   cache-integrity.test.js # 稀疏缓存完整性校验用例（30 个）
   cache-retention.test.js # 缓存保留规划用例（29 个）
   shared-fetch.test.js  # 共享回源规划用例（34 个）
+  cache-reuse.test.js   # 编辑后缓存复用用例（29 个，含 300 组随机用例对照逐字节参考模型）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 244 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划
+npm test          # 273 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划 + 编辑后缓存复用
 npm start
 ```
 
@@ -880,3 +989,11 @@ npm start
   非空字符串且不得重复（空、纯空白、重复均 `400`），`clients` 上限 1000 项、
   单客户端区间与全部客户端区间合计均上限 10000 项，防止超大输入耗尽资源；
   所有偏移与字节核算全程在安全整数范围内，回源总长度不会超过资源大小。
+- `/cache-reuse-plan` 同样使用严格校验器：所有数值必须是非负安全整数，
+  多余字段一律 `400`；`cached` 与 `edits` 各上限 1000 项，缓存区间必须满足
+  `0 ≤ start ≤ end < size`（故 `size: 0` 时缓存必须为空），删除必须满足
+  `start + deleteBytes ≤ size`（`start === size` 仅允许尾部插入）；同起点编辑、
+  后一编辑起点落入前一删除范围、双零编辑均 `400`，新大小超过
+  `Number.MAX_SAFE_INTEGER` 返回 `400 NEW_SIZE_OVERFLOW`。全程只对区间端点做
+  加减（规模与字节数无关，可直接处理接近 2^53 字节的资源），并在每次插入前
+  单独做上溢守卫，任何中间结果都不会丢失精度。

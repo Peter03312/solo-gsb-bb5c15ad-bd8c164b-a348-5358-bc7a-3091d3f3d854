@@ -34,6 +34,11 @@ import {
   MAX_RANGES_PER_CLIENT,
   MAX_CLIENT_ID_LENGTH,
 } from './shared-fetch.js';
+import {
+  planCacheReuse,
+  MAX_CACHED_INTERVALS as MAX_REUSE_CACHED_INTERVALS,
+  MAX_EDITS,
+} from './cache-reuse.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -231,6 +236,36 @@ const sharedFetchBodySchema = {
   },
 };
 
+const reuseEditSchema = {
+  type: 'object',
+  required: ['start', 'deleteBytes', 'insertBytes'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    deleteBytes: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    insertBytes: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const cacheReuseBodySchema = {
+  type: 'object',
+  required: ['size', 'cached', 'edits'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    cached: {
+      type: 'array',
+      maxItems: MAX_REUSE_CACHED_INTERVALS,
+      items: cacheIntervalSchema,
+    },
+    edits: {
+      type: 'array',
+      maxItems: MAX_EDITS,
+      items: reuseEditSchema,
+    },
+  },
+};
+
 // Resume planning demands strict types: Fastify's default ajv setup coerces
 // scalar types and silently strips unknown properties, which would let a
 // string like "1000" pass as a byte count. This route therefore validates
@@ -423,6 +458,26 @@ export function buildApp(config = {}) {
         clients: request.body.clients,
         maxFetchBytes: request.body.maxFetchBytes,
         maxGapBytes: request.body.maxGapBytes,
+      });
+
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Sparse-cache reuse after edits: POST /cache-reuse-plan with the old size,
+  // the cached closed intervals and the edits (expressed in old coordinates);
+  // no Range header involved.
+  app.post(
+    '/cache-reuse-plan',
+    {
+      schema: { body: cacheReuseBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = planCacheReuse({
+        size: request.body.size,
+        cached: request.body.cached,
+        edits: request.body.edits,
       });
 
       return reply.status(result.statusCode).send(result);
